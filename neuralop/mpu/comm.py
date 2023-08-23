@@ -16,9 +16,14 @@
 
 import os
 import logging
+import math
+from typing import Union, Literal, List, Dict, Tuple, Optiona
+import datetime as dt
+import numpy as np
+
 import torch
 import torch.distributed as dist
-import datetime as dt
+
 
 class disable_logging(object):
     def __init__(self, level=logging.ERROR):
@@ -32,10 +37,63 @@ class disable_logging(object):
 
 
 # dummy placeholders
-_DATA_PARALLEL_GROUP = None
-_MODEL_PARALLEL_GROUP = None
+_COMM_LIST = []
+_COMM_NAMES = {}
+_COMM_ROOTS = {}
+
 
 # world comm
+def get_size(comm_id: Union[str, int]) -> int:
+    if isinstance(comm_id, int):
+        cid = comm_id
+    else:
+        cid = _COMM_NAMES[comm_id] if (comm_id in _COMM_NAMES) else len(_COMM_LIST)
+
+    if not dist.is_initialized() or (cid >= len(_COMM_LIST)):
+        return 1
+    else:
+        return dist.get_world_size(group=_COMM_LIST[cid])
+
+
+def get_rank(comm_id: Union[str, int]) -> int:
+    if isinstance(comm_id, int):
+        cid = comm_id
+    else:
+        cid = _COMM_NAMES[comm_id] if (comm_id in _COMM_NAMES) else len(_COMM_LIST)
+
+    if not dist.is_initialized() or (cid >= len(_COMM_LIST)):
+        return 0
+    else:
+        return dist.get_rank(group=_COMM_LIST[cid])
+
+
+def get_group(comm_id: Union[str, int]) -> int:
+    if isinstance(comm_id, int):
+        cid = comm_id
+    else:
+        cid = _COMM_NAMES[comm_id] if (comm_id in _COMM_NAMES) else len(_COMM_LIST)
+
+    if not dist.is_initialized() or (cid >= len(_COMM_LIST)):
+        raise IndexError(f"Error, comm with id {comm_id} not available.")
+    else:
+        return _COMM_LIST[cid]
+
+
+def get_root(comm_id: Union[str, int]) -> int:
+    if isinstance(comm_id, str):
+        cname = comm_id
+        cid = _COMM_NAMES[comm_id] if (comm_id in _COMM_NAMES) else len(_COMM_LIST)
+    else:
+        cname = _COMM_LIST[comm_id] if comm_id < len(_COMM_LIST) else ""
+        cid = comm_id
+
+    if not dist.is_initialized() or (cid >= len(_COMM_LIST)):
+        return 0
+    else:
+        return _COMM_ROOTS[cname]
+
+
+# specialized routines for world comms
 def get_world_size():
     if not dist.is_initialized():
         return 1
@@ -51,182 +109,272 @@ def get_world_rank():
 
 
 def get_local_rank():
+    if os.getenv("LOCAL_RANK") is not None:
+        # Use PyTorch env var if available
+        return int(os.getenv("LOCAL_RANK"))
+
     if not dist.is_initialized():
         return 0
     else:
-        return get_world_rank() % torch.cuda.device_count()
+        num_gpu = int(os.getenv("NGPU_PER_NODE", torch.cuda.device_count()))
+        return get_world_rank() % num_gpu
 
 
-# data parallel
-def get_data_parallel_size():
-    if not dist.is_initialized():
-        return 1
-    else:
-        return dist.get_world_size(group=_DATA_PARALLEL_GROUP)
+def get_names():
+    return _COMM_NAMES
 
 
-def get_data_parallel_rank():
-    if not dist.is_initialized():
-        return 0
-    else:
-        return dist.get_rank(group=_DATA_PARALLEL_GROUP)
+def is_distributed(name: str):
+    return name in _COMM_NAMES
 
 
-def get_data_parallel_group():
-    assert dist.is_initialized(), "Error, initialize torch.distributed first"
-    return _DATA_PARALLEL_GROUP 
+# get
+def init(
+    wireup_info: Literal["env", "mpi"] = "env",
+    wireup_store: Literal["tcp", "file"] = "tcp",
+    model_parallel_sizes: List[int] = [1],
+    model_parallel_names: List[str] = ["model"],
+    log_to_screen: bool = False,
+    verbose: bool = False,
+):
+    init_process_group(info=wireup_info, store=wireup_store)
+
+    # do individual wireup for model parallel comms:
+    model_parallel_size = init_model_parallel_info(
+        names=model_parallel_names,
+        sizes=model_parallel_sizes,
+        log_to_screen=log_to_screen,
+        verbose=verbose,
+    )
+
+    return model_parallel_size
 
 
-# model parallel
-def get_model_parallel_size():
-    if not dist.is_initialized() or (_MODEL_PARALLEL_GROUP is None):
-        return 1
-    else:
-        return dist.get_world_size(group=_MODEL_PARALLEL_GROUP)
+def init_process_group(
+    info: Literal["env", "mpi"] = "env", store: Literal["tcp", "file"] = "tcp"
+):
+    """Initial torch distributed process group based on ``info`` and ``store``
 
+    Uses NCCL
 
-def get_model_parallel_rank():
-    if not dist.is_initialized() or (_MODEL_PARALLEL_GROUP is None):
-        return 0
-    else:
-        return dist.get_rank(group=_MODEL_PARALLEL_GROUP)
+    Args:
+        info: either ``env`` or ``mpi``
+        store: either ``file`` or ``tcp``
 
-
-def get_model_parallel_group():
-    assert dist.is_initialized(), "Error, initialize torch.distributed first"
-    return _MODEL_PARALLEL_GROUP  
-
-# get 
-def init(config, verbose = False):
-    
+    """
     # set up global and local communicator
-    if config.distributed == "env":
-
-        world_size = int(os.getenv('WORLD_SIZE', 1))
-        world_rank = int(os.getenv('WORLD_RANK', 0))
-        port = int(os.getenv('MASTER_PORT', 0))
-        master_address = os.getenv('MASTER_ADDRESS')
-    
-    
-    elif config.distributed.wireup_info == "mpi":
-
+    if info == "env":
+        world_size = int(os.getenv("WORLD_SIZE", 1))
+        world_rank = int(os.getenv("RANK", 0))
+        if os.getenv("WORLD_RANK") is not None:
+            # Use WORLD_RANK if available for backwards compatibility
+            world_rank = int(os.getenv("WORLD_RANK"))
+        port = int(os.getenv("MASTER_PORT", 0))
+        master_address = os.getenv("MASTER_ADDR")
+        if os.getenv("MASTER_ADDRESS") is not None:
+            # Use MASTER_ADDRESS if available for backwards compatibility
+            master_address = int(os.getenv("MASTER_ADDRESS"))
+    elif info == "mpi":
         import socket
         from mpi4py import MPI
 
         mpi_comm = MPI.COMM_WORLD.Dup()
         world_size = mpi_comm.Get_size()
         world_rank = mpi_comm.Get_rank()
-        my_host = '127.0.0.1'
+        my_host = socket.gethostname()
         port = 29500
-        master_address = mpi_comm.bcast(my_host, root=0)
+        master_address = None
+        if world_rank == 0:
+            master_address_info = socket.getaddrinfo(
+                my_host, port, family=socket.AF_INET, proto=socket.IPPROTO_TCP
+            )
+            master_address = master_address_info[0][-1][0]
+        master_address = mpi_comm.bcast(master_address, root=0)
         os.environ["MASTER_ADDRESS"] = master_address
         os.environ["MASTER_PORT"] = str(port)
-
     else:
-        raise ValueError(f"Error, wireup-info {config.distributed.wireup_info} not supported")
-    
-    # set local rank to 0 for now
-    local_rank = 0
-    
+        raise ValueError(f"Error, wireup-info {info} not supported")
+
     if world_size > 1:
         with disable_logging():
-            if config.distributed.wireup_store == "file":
-
-                wireup_file_path = os.getenv('WIREUP_FILE_PATH')
-                wireup_store = dist.FileStore(wireup_file_path, world_size)
-            
-            elif config.distributed.wireup_store == "tcp":
+            if store == "file":
+                wireup_file_path = os.getenv("WIREUP_FILE_PATH")
+                store = dist.FileStore(wireup_file_path, world_size)
+            elif store == "tcp":
                 # create tcp store
-                wireup_store = dist.TCPStore(host_name = master_address,
-                                             port = port,
-                                             world_size = world_size,
-                                             is_master = (world_rank == 0),
-                                             timeout = dt.timedelta(seconds=900))
-                
+                store = dist.TCPStore(
+                    host_name=master_address,
+                    port=port,
+                    world_size=world_size,
+                    is_master=(world_rank == 0),
+                    timeout=dt.timedelta(seconds=900),
+                )
+            else:
+                store = None
+
             # initialize process groups
-            dist.init_process_group(backend = 'nccl',
-                                    rank = world_rank,
-                                    world_size = world_size,
-                                    store = wireup_store)
-        
-            # get sizes
-            world_size = get_world_size()
-            world_rank = get_world_rank()
-            local_rank = get_local_rank()
+            dist.init_process_group(
+                backend="nccl", rank=world_rank, world_size=world_size, store=store
+            )
 
-            # barrier
-            dist.barrier(device_ids=[local_rank])
 
-    # process 0 is logger 
-    is_logger = (get_world_rank() == 0)
+def init_model_parallel_info(names, sizes, log_to_screen=False, verbose=False):
+    """Create communicators for model parallelism _COMM_LIST, _COMM_NAMES, and
+    _COMM_ROOTS"""
+    # get sizes
+    world_size = get_world_size()
+    world_rank = get_world_rank()
 
-    # get model groups
-    model_group_size = config.distributed.model_parallel_size
-    
-    # compute data parallel size 
-    data_group_size = world_size // model_group_size
+    model_parallel_names = names
+    model_parallel_sizes = sizes
 
-    if is_logger:
-        print(f"Using {world_size} in {model_group_size} x {data_group_size} decomposition (#model-ranks x #data-ranks)")
+    assert len(model_parallel_names) == len(
+        model_parallel_sizes
+    ), "Please specify names for your communicators"
+    model_parallel_size = math.prod(model_parallel_sizes)
 
-    assert ( (model_group_size <= world_size) and (world_size % model_group_size == 0) ), \
-        "Error, please make sure matmul_parallel_size * spatial_parallel_size <= world size and that world size is evenly divisible by matmul_parallel_size * spatial_parallel_size"
-    
-    # number of model groups
-    num_model_groups = world_size // model_group_size
+    assert (
+        world_size % model_parallel_size == 0
+    ), "Error, please make sure that the product of model parallel ranks evenly divides the total number of ranks"
 
-    global _DATA_PARALLEL_GROUP
-    global _MODEL_PARALLEL_GROUP
+    # we set this to be orthogonal to the MP groups
+    # we can play tricks with the ddp_group later, in case if all the weights are shared
+    data_parallel_size = world_size // model_parallel_size
 
-    if is_logger:
-        print("Starting Wireup")
+    # create orthogonal communicators first
+    global _COMM_LIST
+    global _COMM_NAMES
+    if log_to_screen:
+        logging.info("Starting Wireup")
 
     if world_size > 1:
-        if model_group_size > 1:
+        # set up the strides:
+        model_grid = np.reshape(
+            np.arange(0, model_parallel_size), model_parallel_sizes[::-1]
+        )
+        perm = np.roll(np.arange(0, len(model_parallel_sizes)), 1).tolist()
+        ranks_lookup = {}
+
+        comm_count = 0
+        for mpname in model_parallel_names:
+            base_group = np.reshape(model_grid, (-1, model_grid.shape[-1]))
             model_groups = []
-            for i in range(num_model_groups):
-                start = i*model_group_size
-                end = start + model_group_size
-                model_groups.append(list(range(start, end)))
-                    
-            data_groups = [sorted(list(i)) for i in zip(*model_groups)]                     
+            for goffset in range(0, world_size, model_parallel_size):
+                model_groups += sorted((goffset + base_group).tolist())
 
-            if verbose and is_logger:
-                print("Model Parallel Groups w/ respect to world rank:")
-                for grp in model_groups:
-                    print(grp)
-            
-            if verbose and is_logger:
-                print("Data Parallel Groups w/ respect to world rank:")
-                for grp in data_groups:
-                    print(grp)
+            if verbose and world_rank == 0:
+                print(f"Creating comm groups for id {mpname}: {model_groups}")
 
-            # initialize groups
-            with disable_logging():
-                # data groups
-                for grp in data_groups:
-                    tmp_group = dist.new_group(ranks = grp)
+            for grp in model_groups:
+                if len(grp) > 1:
+                    tmp_group = dist.new_group(ranks=grp)
                     if world_rank in grp:
-                        _DATA_PARALLEL_GROUP = tmp_group
-                # model groups
+                        _COMM_LIST.append(tmp_group)
+                        _COMM_NAMES[mpname] = comm_count
+                        _COMM_ROOTS[mpname] = grp[0]
+                        comm_count += 1
+            ranks_lookup[mpname] = model_groups
+
+            # go for the next step
+            model_grid = np.transpose(model_grid, perm)
+
+        # helper routine for creating meta comms
+        def merge_comms(comm_count, ranks_lookup, comm_name_1, comm_name_2, merge_name):
+            if (get_size(comm_name_1) == 1) and (get_size(comm_name_2) > 1):
+                if verbose and world_rank == 0:
+                    print(
+                        f"Creating comm groups for id {merge_name}: {ranks_lookup[comm_name_2]}"
+                    )
+                _COMM_LIST.append(get_group(comm_name_2))
+                _COMM_NAMES[merge_name] = comm_count
+                _COMM_ROOTS[merge_name] = ranks_lookup[comm_name_2][0]
+                comm_count += 1
+            elif (get_size(comm_name_1) > 1) and (get_size(comm_name_2) == 1):
+                if verbose and world_rank == 0:
+                    print(
+                        f"Creating comm groups for id {merge_name}: {ranks_lookup[comm_name_1]}"
+                    )
+                _COMM_LIST.append(get_group(comm_name_1))
+                _COMM_NAMES[merge_name] = comm_count
+                _COMM_ROOTS[merge_name] = ranks_lookup[comm_name_1][0]
+                comm_count += 1
+            elif (get_size(comm_name_1) > 1) and (get_size(comm_name_2) > 1):
+                # fuse the lists:
+                def merge_ranks(list1, list2):
+                    coll = list1 + list2
+                    pooled = [set(subList) for subList in coll]
+                    merging = True
+                    while merging:
+                        merging = False
+                        for i, group in enumerate(pooled):
+                            merged = next(
+                                (g for g in pooled[i + 1 :] if g.intersection(group)),
+                                None,
+                            )
+                            if not merged:
+                                continue
+                            group.update(merged)
+                            pooled.remove(merged)
+                            merging = True
+                    return [list(x) for x in pooled]
+
+                model_groups = merge_ranks(
+                    ranks_lookup[comm_name_1], ranks_lookup[comm_name_2]
+                )
+                if verbose and world_rank == 0:
+                    print(f"Creating comm groups for id {merge_name}: {model_groups}")
                 for grp in model_groups:
-                    tmp_group = dist.new_group(ranks = grp)
+                    tmp_group = dist.new_group(ranks=grp)
                     if world_rank in grp:
-                        _MODEL_PARALLEL_GROUP = tmp_group
-                                
+                        _COMM_LIST.append(tmp_group)
+                        _COMM_NAMES[merge_name] = comm_count
+                        _COMM_ROOTS[merge_name] = grp[0]
+                        comm_count += 1
+
+            return comm_count
+
+        # merge spatial
+        comm_count = merge_comms(comm_count, ranks_lookup, "h", "w", "spatial")
+
+        # merge matmul
+        comm_count = merge_comms(comm_count, ranks_lookup, "fin", "fout", "matmul")
+
+        # now the data and model comm:
+        model_groups = np.reshape(
+            np.arange(0, world_size), (-1, model_parallel_size)
+        ).tolist()
+        for grp in model_groups:
+            if len(grp) > 1:
+                tmp_group = dist.new_group(ranks=grp)
+                if world_rank in grp:
+                    _COMM_LIST.append(tmp_group)
+                    _COMM_NAMES["model"] = comm_count
+                    _COMM_ROOTS["model"] = grp[0]
+                    comm_count += 1
+
+        if data_parallel_size == world_size:
+            if verbose and world_rank == 0:
+                print(
+                    f"Creating comm groups for id data: {[list(range(0, world_size))]}"
+                )
+
+            _COMM_LIST.append(None)
+            _COMM_NAMES["data"] = comm_count
+            _COMM_ROOTS["data"] = 0
         else:
-            # technically unnecessary but we do it to be clean
-            with disable_logging():
-                _MODEL_PARALLEL_GROUP = dist.new_group(ranks = [world_rank])
-                _SPATIAL_PARALLEL_GROUP = _MODEL_PARALLEL_GROUP
-                _MATMUL_PARALLEL_GROUP = _MODEL_PARALLEL_GROUP
-                _DATA_PARALLEL_GROUP = dist.new_group(ranks = list(range(world_size)))
+            data_groups = [sorted(list(i)) for i in zip(*model_groups)]
 
-    # barrier
-    if dist.is_initialized():
-        dist.barrier(device_ids=[local_rank])
+            if verbose and world_rank == 0:
+                print(f"Creating comm groups for id data: {data_groups}")
 
-    if is_logger:
-        print("Finished Wireup")
-    
-    return
+            for grp in data_groups:
+                tmp_group = dist.new_group(ranks=grp)
+                if world_rank in grp:
+                    _COMM_LIST.append(tmp_group)
+                    _COMM_NAMES["data"] = comm_count
+                    _COMM_ROOTS["data"] = grp[0]
+
+    if log_to_screen:
+        logging.info("Finished Wireup")
+
+    return model_parallel_size
