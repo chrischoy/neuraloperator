@@ -17,7 +17,7 @@
 import os
 import logging
 import math
-from typing import Union, Literal, List, Dict, Tuple, Optiona
+from typing import Union, Literal, List, Dict, Tuple, Optional
 import datetime as dt
 import numpy as np
 

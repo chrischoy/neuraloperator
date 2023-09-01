@@ -1,7 +1,7 @@
 import torch
 import math 
 from torch import nn
-from neuralop.mpu.mappings import gather_from_model_parallel_region, scatter_to_model_parallel_region
+from neuralop.mpu.mappings import gather_from_parallel_region, scatter_to_parallel_region
 import neuralop.mpu.comm as comm
 
 
@@ -41,14 +41,14 @@ class MultigridPatching2D(nn.Module):
         #If not stitching, scatter truth, otherwise keep on every GPU
         if self.use_distributed and not self.stitching:
             y = make_patches(y, n=self.n_patches, p=0)
-            y = scatter_to_model_parallel_region(y, 0)
+            y = scatter_to_parallel_region(y, 0)
 
         #Create padded patches in batch dimension (identity if levels=0)
         x = self._make_mg_patches(x)
 
         #Split data across processes
         if self.use_distributed:
-            x = scatter_to_model_parallel_region(x, 0)
+            x = scatter_to_parallel_region(x, 0)
         
         return x, y
 
@@ -64,7 +64,7 @@ class MultigridPatching2D(nn.Module):
 
         #Gather patches if they are to be stiched back together
         if self.use_distributed and self.stitching:
-            x = gather_from_model_parallel_region(x, dim=0)
+            x = gather_from_parallel_region(x, dim=0)
         else:
             x = x
 

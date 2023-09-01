@@ -2,7 +2,7 @@ from typing import Union
 
 import torch
 from torch import nn
-from jaxtyping import Shaped, Float
+
 from neuralop.mpu.rank import convert_to_device, convert_to_rank
 from neuralop.mpu.broadcast import broadcast_tensor
 
@@ -53,8 +53,8 @@ class NeighborSearch(nn.Module):
 
     def forward(
         self,
-        data: Float[torch.Tensor, "N 3"],
-        queries: Float[torch.Tensor, "M 3"],
+        data: torch.Tensor,
+        queries: torch.Tensor,
         radius: float,
     ) -> NeighborSearchReturn:
         """Find the neighbors, in data, of each point in queries
@@ -201,26 +201,27 @@ class DistributedNeighborSearchReturn(NeighborSearchReturn):
 class DistributedNeighborSearch(NeighborSearch):
     def __init__(
         self,
-        radius: float,
+        use_open3d: bool = True,
         search_device: Union[str, int, torch.device] = "cuda:0",
     ):
-        super().__init__(radius)
+        super().__init__(use_open3d=use_open3d)
         self.search_device = convert_to_device(search_device)
         self.search_rank = convert_to_rank(search_device)
 
     @torch.no_grad()
     def forward(
         self,
-        inp_positions: Float[torch.Tensor, "N 3"],
-        out_positions: Float[torch.Tensor, "M 3"],
-    ) -> NeighborSearchReturn:
+        inp_positions: torch.Tensor,
+        out_positions: torch.Tensor,
+        radius: float,
+    ) -> DistributedNeighborSearchReturn:
         # Search only on the search_device
         rank = torch.distributed.get_rank()
         neighbors = None
         if rank == self.search_rank:
             assert inp_positions.device == self.search_device
             torch.cuda.set_device(self.search_device)
-            neighbors = self.nsearch(inp_positions, out_positions, self.radius)
+            neighbors = self.nsearch(inp_positions, out_positions, radius)
         neighbors = DistributedNeighborSearchReturn(
             neighbors, src_device=self.search_device
         )

@@ -12,104 +12,121 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-import types
-from typing import Any
-
 import torch
 import torch.distributed as dist
-from .comm import get_model_parallel_group
-
-# torch utils
-from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+import neuralop.mpu.comm as comm
 
 # helper functions
-from .helpers import split_tensor_along_dim
 from .helpers import _reduce
 from .helpers import _split
 from .helpers import _gather
 
-# model parallel
-class _CopyToModelParallelRegion(torch.autograd.Function):
-    """Pass the input to the model parallel region."""
+
+# generalized
+class _CopyToParallelRegion(torch.autograd.Function):
+    """Pass the input to the parallel region."""
+    @staticmethod
+    def symbolic(graph, input_, comm_id_):
+        return input_
 
     @staticmethod
-    def symbolic(graph, input_):
-        return input_
-    
-    @staticmethod
-    def forward(ctx, input_):
+    def forward(ctx, input_, comm_id_):
+        ctx.comm_id = comm_id_
         return input_
 
     @staticmethod
     def backward(ctx, grad_output):
-        return _reduce(grad_output, group=get_model_parallel_group())
+        if comm.is_distributed(ctx.comm_id):
+            return _reduce(grad_output, group=comm.get_group(ctx.comm_id)), None
+        else:
+            return grad_output, None 
 
 
-class _ReduceFromModelParallelRegion(torch.autograd.Function):
-    """All-reduce the input from the model parallel region."""
+class _ReduceFromParallelRegion(torch.autograd.Function):
+    """All-reduce the input from the parallel region."""
     
     @staticmethod
-    def symbolic(graph, input_):
-        return _reduce(input_, group=get_model_parallel_group())
-    
+    def symbolic(graph, input_, comm_id_):
+        if comm.is_distributed(comm_id_):
+            return _reduce(input_, group=comm.get_group(comm_id_))
+        else:
+            return input_
+
     @staticmethod
-    def forward(ctx, input_):
-        return _reduce(input_, group=get_model_parallel_group())
-    
+    def forward(ctx, input_, comm_id_):
+        if comm.is_distributed(comm_id_):
+            return _reduce(input_, group=comm.get_group(comm_id_))
+        else:
+            return input_
+
     @staticmethod
     def backward(ctx, grad_output):
-        return grad_output
+        return grad_output, None
 
-
-class _ScatterToModelParallelRegion(torch.autograd.Function):
+    
+class _ScatterToParallelRegion(torch.autograd.Function):
     """Split the input and keep only the corresponding chuck to the rank."""
-    
+
     @staticmethod
-    def symbolic(graph, input_, dim_):
-        return _split(input_, dim_, group=get_model_parallel_group())
-    
+    def symbolic(graph, input_, dim_, comm_id_):
+        return _split(input_, dim_, group=comm.get_group(comm_id_))
+
     @staticmethod
-    def forward(ctx, input_, dim_):
+    def forward(ctx, input_, dim_, comm_id_):
         ctx.dim = dim_
-        return _split(input_, dim_, group=get_model_parallel_group())
-    
+        ctx.comm_id = comm_id_
+        if comm.is_distributed(comm_id_):
+            return _split(input_, dim_, group=comm.get_group(comm_id_))
+        else:
+            return input_
+
     @staticmethod
     def backward(ctx, grad_output):
-        return _gather(grad_output, ctx.dim, group=get_model_parallel_group()), None
-    
-    
-class _GatherFromModelParallelRegion(torch.autograd.Function):
-    """Gather the input from model parallel region and concatinate."""
-    
+        if comm.is_distributed(ctx.comm_id):
+            return _gather(grad_output, ctx.dim, group=comm.get_group(ctx.comm_id)), None, None
+        else:
+            return grad_output, None, None
+
+
+class _GatherFromParallelRegion(torch.autograd.Function):
+    """Gather the input from parallel region and concatenate."""
+
     @staticmethod
-    def symbolic(graph, input_, dim_):
-        return _gather(input_, dim_, group=get_model_parallel_group())
-    
+    def symbolic(graph, input_, dim_, comm_id_):
+        if comm.is_distributed(comm_id_):
+            return _gather(input_, dim_, group=comm.get_group(comm_id_))
+        else:
+            return input_
+
     @staticmethod
-    def forward(ctx, input_, dim_):
+    def forward(ctx, input_, dim_, comm_id_):
         ctx.dim = dim_
-        return _gather(input_, dim_, group=get_model_parallel_group())
-    
+        ctx.comm_id = comm_id_
+        if comm.is_distributed(comm_id_):
+            return _gather(input_, dim_, group=comm.get_group(comm_id_))
+        else:
+            return input_
+
     @staticmethod
     def backward(ctx, grad_output):
-        return _split(grad_output, ctx.dim, group=get_model_parallel_group()), None
+        if comm.is_distributed(ctx.comm_id):
+            return _split(grad_output, ctx.dim, group=comm.get_group(ctx.comm_id)), None, None
+        else:
+            return grad_output, None, None
+
     
 # -----------------
 # Helper functions.
 # -----------------
-# matmul parallel
-def copy_to_model_parallel_region(input_):
-    return _CopyToModelParallelRegion.apply(input_)
+# general
+def copy_to_parallel_region(input_, comm_name):
+    return _CopyToParallelRegion.apply(input_, comm_name)
 
+def reduce_from_parallel_region(input_, comm_name):
+    return _ReduceFromParallelRegion.apply(input_, comm_name)
 
-def reduce_from_model_parallel_region(input_):
-    return _ReduceFromModelParallelRegion.apply(input_)
+def scatter_to_parallel_region(input_, dim, comm_name):
+    return _ScatterToParallelRegion.apply(input_, dim, comm_name)
 
-
-def scatter_to_model_parallel_region(input_, dim):
-    return _ScatterToModelParallelRegion.apply(input_, dim)
-
-
-def gather_from_model_parallel_region(input_, dim):
-    return _GatherFromModelParallelRegion.apply(input_, dim)
+def gather_from_parallel_region(input_, dim, comm_name):
+    return _GatherFromParallelRegion.apply(input_, dim, comm_name)

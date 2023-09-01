@@ -1,5 +1,4 @@
 from typing import Optional, Union, List, Literal, Callable
-from jaxtyping import Shaped, Float
 
 import torch
 from torch import nn
@@ -11,7 +10,7 @@ from neuralop.layers.neighbor_search import (
     NeighborSearchReturn,
     DistributedNeighborSearchReturn,
 )
-from neuralop.mpu.mappings import gather_from_model_parallel_region
+from neuralop.mpu.mappings import gather_from_parallel_region
 
 
 class IntegralTransform(nn.Module):
@@ -187,11 +186,11 @@ class DistributedIntegralTransform(nn.Module):
 
     def forward(
         self,
-        in_features: Float[torch.Tensor, "N C_in"],
+        in_features: torch.Tensor,
         neighbors: DistributedNeighborSearchReturn,
-        node_features: Optional[Float[torch.Tensor, "M C_in"]] = None,
-        in_weights: Optional[Float[torch.Tensor, "N"]] = None,
-    ) -> Float[torch.Tensor, "M C_out"]:
+        node_features: Optional[torch.Tensor] = None,
+        in_weights: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         assert in_features is not None, f"Input features cannot be None"
         assert neighbors is not None, f"Neighbors cannot be None"
 
@@ -234,5 +233,5 @@ class DistributedIntegralTransform(nn.Module):
             reduce=self.reduction,
         )
 
-        out_features = gather_from_model_parallel_region(out_features_dev, dim=0)
+        out_features = gather_from_parallel_region(out_features_dev, dim=0)
         return out_features
